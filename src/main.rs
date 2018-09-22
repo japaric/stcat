@@ -3,216 +3,230 @@
 #[macro_use]
 extern crate clap;
 #[macro_use]
-extern crate error_chain;
+extern crate failure;
+#[macro_use]
+extern crate slog;
+extern crate slog_async;
+extern crate slog_term;
 extern crate xmas_elf;
 
-use std::collections::HashMap;
-use std::fmt;
-use std::fs::File;
-use std::io::{self, Read, Write};
+use std::{
+    collections::HashMap,
+    fs::File,
+    io::{self, Read, Write},
+    process,
+};
 
 use clap::{App, Arg};
-use xmas_elf::ElfFile;
-use xmas_elf::sections::SectionData;
-use xmas_elf::symbol_table::Entry;
+use slog::{Drain, Level, Logger};
+use slog_async::Async;
+use slog_term::{CompactFormat, TermDecorator};
+use xmas_elf::{sections::SectionData, symbol_table::Entry, ElfFile};
 
-use errors::*;
-
-mod errors {
-    error_chain!();
-}
-
-quick_main!(run);
-
-// Log level
-#[derive(Eq, Ord, PartialEq, PartialOrd)]
-enum Level {
-    Trace,
-    Debug,
-    Info,
-    Warn,
-    Error,
-}
-
-impl fmt::Display for Level {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
-            Level::Trace => f.write_str("TRACE"),
-            Level::Debug => f.write_str("DEBUG"),
-            Level::Info => f.write_str("INFO"),
-            Level::Warn => f.write_str("WARN"),
-            Level::Error => f.write_str("ERROR"),
-        }
+fn main() {
+    if let Err(e) = run() {
+        eprintln!("error: {}", e);
+        process::exit(101);
     }
 }
 
-struct Message<'a> {
-    level: Level,
-    string: &'a str,
-}
-
-fn run() -> Result<()> {
-    let args = App::new("stcat")
+fn run() -> Result<(), failure::Error> {
+    let matches = App::new("stcat")
+        .about("Decode logs produced by the `stlog` framework")
         .author(crate_authors!())
         .version(crate_version!())
-        .about("Decodes strings logged via the `stlog` framework")
         .arg(
             Arg::with_name("elf")
-                .help("ELF file where log strings are stored")
                 .short("e")
+                .long("elf")
+                .value_name("ELF")
                 .takes_value(true)
-                .value_name("ELF"),
-        )
-        .arg(
-            Arg::with_name("debug")
-                .help("increases the debug level (default = info)")
-                .short("d")
-                .multiple(true)
-                .takes_value(false),
-        )
-        .get_matches();
+                .required(true)
+                .help("ELF file whose symbol table will be used to decode the logs"),
+        ).arg(
+            Arg::with_name("filter")
+                .short("f")
+                .long("filter")
+                .value_name("LEVEL")
+                .takes_value(true)
+                .required(false)
+                .help("Decodes only messages of this severity or higher (default: trace)"),
+        ).arg(
+            Arg::with_name("LOGFILE")
+                .required(false)
+                .index(1)
+                .help("Log file to decode; if omitted stdin will be decoded"),
+        ).get_matches();
 
-    let path = args.value_of("elf").unwrap();
-    let requested_level = match args.occurrences_of("debug") {
-        0 => Level::Info,
-        1 => Level::Debug,
-        _ => Level::Trace,
+    let severity = match matches.value_of("severity") {
+        Some("error") => Level::Error,
+        Some("warning") => Level::Warning,
+        Some("info") => Level::Info,
+        Some("debug") => Level::Debug,
+        Some("trace") => Level::Trace,
+        Some(_) => bail!("Level must be one of: error, warning, info, debug or trace"),
+        None => Level::Trace,
     };
 
-    let mut file = File::open(path).chain_err(
-        || format!("couldn't open {}", path),
-    )?;
-    let mut contents = vec![];
-    file.read_to_end(&mut contents).chain_err(|| {
-            format!("couldn't read {}", path)
-        })?;
+    let mut bytes = vec![];
+    File::open(matches.value_of("elf").unwrap())?.read_to_end(&mut bytes)?;
+    let elf = ElfFile::new(&bytes).map_err(failure::err_msg)?;
 
-    let elf = ElfFile::new(&contents);
-
-    let table = if let Some(sh) = elf.find_section_by_name(".symtab") {
-        let data = sh.get_data(&elf)?;
-
-        if let SectionData::SymbolTable32(entries) = data {
-            let (strace, shndx) = entries
-                .iter()
-                .find(|entry| entry.get_name(&elf) == Ok("_sstlog_trace"))
-                .map(|entry| (entry.value(), entry.shndx()))
-                .ok_or("_sstlog_trace symbol not found")?;
-
-            let mut etrace = None;
-            let mut sdebug = None;
-            let mut edebug = None;
-            let mut sinfo = None;
-            let mut einfo = None;
-            let mut swarn = None;
-            let mut ewarn = None;
-            let mut serror = None;
-            let mut eerror = None;
-
-            // unclassified messages
-            let mut messages = vec![];
-
-            for entry in entries {
-                if entry.shndx() == shndx {
-                    // magic `info` value
-                    const MAGIC: u8 = 1;
-
-                    if entry.info() == MAGIC {
-                        messages.push(entry);
-                        continue;
-                    }
-
-                    if entry.get_name(&elf) == Ok("_estlog_trace") {
-                        etrace = Some(entry.value());
-                    } else if entry.get_name(&elf) == Ok("_sstlog_debug") {
-                        sdebug = Some(entry.value());
-                    } else if entry.get_name(&elf) == Ok("_estlog_debug") {
-                        edebug = Some(entry.value());
-                    } else if entry.get_name(&elf) == Ok("_sstlog_info") {
-                        sinfo = Some(entry.value());
-                    } else if entry.get_name(&elf) == Ok("_estlog_info") {
-                        einfo = Some(entry.value());
-                    } else if entry.get_name(&elf) == Ok("_sstlog_warn") {
-                        swarn = Some(entry.value());
-                    } else if entry.get_name(&elf) == Ok("_estlog_warn") {
-                        ewarn = Some(entry.value());
-                    } else if entry.get_name(&elf) == Ok("_sstlog_error") {
-                        serror = Some(entry.value());
-                    } else if entry.get_name(&elf) == Ok("_estlog_error") {
-                        eerror = Some(entry.value());
-                    }
-                }
-            }
-
-            let etrace = etrace.ok_or("_estlog_trace symbol not found")?;
-            let sdebug = sdebug.ok_or("_sstlog_debug symbol not found")?;
-            let edebug = edebug.ok_or("_estlog_debug symbol not found")?;
-            let sinfo = sinfo.ok_or("_sstlog_info symbol not found")?;
-            let einfo = einfo.ok_or("_estlog_info symbol not found")?;
-            let swarn = swarn.ok_or("_sstlog_warn symbol not found")?;
-            let ewarn = ewarn.ok_or("_estlog_warn symbol not found")?;
-            let serror = serror.ok_or("_sstlog_error symbol not found")?;
-            let eerror = eerror.ok_or("_estlog_error symbol not found")?;
-
-            // id -> message
-            let mut table = HashMap::new();
-
-            for entry in messages {
-                let value = entry.value();
-
-                let level = if value >= strace && value < etrace {
-                    Level::Trace
-                } else if value >= sdebug && value < edebug {
-                    Level::Debug
-                } else if value >= sinfo && value < einfo {
-                    Level::Info
-                } else if value >= swarn && value < ewarn {
-                    Level::Warn
-                } else if value >= serror && value < eerror {
-                    Level::Error
-                } else {
-                    unreachable!()
-                };
-
-                table.insert(
-                    value,
-                    Message {
-                        level: level,
-                        string: entry.get_name(&elf)?,
-                    },
-                );
-            }
-
-            table
-        } else {
-            unreachable!()
+    let messages = if let Some(symtab) = elf.find_section_by_name(".symtab") {
+        match symtab.get_data(&elf).map_err(failure::err_msg)? {
+            SectionData::SymbolTable32(entries) => process_symtab(entries, &elf)?,
+            SectionData::SymbolTable64(entries) => process_symtab(entries, &elf)?,
+            _ => bail!("malformed .symtab section"),
         }
     } else {
-        bail!("{} has no .symtab section", path);
+        bail!(".symtab section not found");
     };
 
-    let stderr = io::stderr();
+    let format = CompactFormat::new(TermDecorator::new().stdout().build());
     let stdin = io::stdin();
-    let stdout = io::stdout();
+    let (input, format): (Box<Read>, _) = if let Some(logfile) = matches.value_of("LOGFILE") {
+        (
+            Box::new(File::open(logfile)?),
+            format.use_custom_timestamp(no_timestamp),
+        )
+    } else {
+        (Box::new(stdin.lock()), format.use_local_timestamp())
+    };
 
-    let stdin = stdin.lock();
-    let mut stdout = stdout.lock();
-    let mut stderr = stderr.lock();
+    let drain = format.build().filter_level(severity).fuse();
+    let logger = Logger::root(Async::new(drain).build().fuse(), o!());
 
-    for byte in stdin.bytes() {
-        let byte = byte.chain_err(|| "I/O error")? as u64;
+    for byte in input.bytes() {
+        let address = u64::from(byte?);
 
-        if let Some(message) = table.get(&byte) {
-            if message.level >= requested_level {
-                writeln!(stdout, "{} {}", message.level, message.string)
-                    .chain_err(|| "I/O error")?;
+        if let Some(message) = messages.get(&address) {
+            match message.severity {
+                Level::Error => error!(logger, "{}", message.content),
+                Level::Warning => warn!(logger, "{}", message.content),
+                Level::Info => info!(logger, "{}", message.content),
+                Level::Debug => debug!(logger, "{}", message.content),
+                Level::Trace => trace!(logger, "{}", message.content),
+                _ => {} // unreachable
             }
-        } else {
-            writeln!(stderr, "unknown message id {}", byte).chain_err(
-                || "I/O error",
-            )?;
         }
     }
 
     Ok(())
+}
+
+fn no_timestamp(_: &mut Write) -> io::Result<()> {
+    Ok(())
+}
+
+fn process_symtab<'a, E>(
+    entries: &'a [E],
+    elf: &'a ElfFile,
+) -> Result<HashMap<u64, Message<'a>>, failure::Error>
+where
+    E: Entry,
+{
+    let (error_start, shndx) = entries
+        .iter()
+        .find(|entry| entry.get_name(&elf) == Ok("__stlog_error_start__"))
+        .map(|entry| (entry.value(), entry.shndx()))
+        .ok_or_else(|| failure::err_msg("symbol `__stlog_error_start__` not found"))?;
+
+    let mut error_end = None;
+    let mut warn_start = None;
+    let mut warn_end = None;
+    let mut info_start = None;
+    let mut info_end = None;
+    let mut debug_start = None;
+    let mut debug_end = None;
+    let mut trace_start = None;
+    let mut trace_end = None;
+
+    let mut unclassified_messages = vec![];
+
+    for entry in entries {
+        if entry.shndx() == shndx {
+            // magic `info` value
+            const MAGIC: u8 = 1;
+
+            if entry.info() == MAGIC {
+                unclassified_messages.push(entry);
+                continue;
+            }
+
+            if entry.get_name(&elf) == Ok("__stlog_error_end__") {
+                error_end = Some(entry.value());
+            } else if entry.get_name(&elf) == Ok("__stlog_warn_start__") {
+                warn_start = Some(entry.value());
+            } else if entry.get_name(&elf) == Ok("__stlog_warn_end__") {
+                warn_end = Some(entry.value());
+            } else if entry.get_name(&elf) == Ok("__stlog_info_start__") {
+                info_start = Some(entry.value());
+            } else if entry.get_name(&elf) == Ok("__stlog_info_end__") {
+                info_end = Some(entry.value());
+            } else if entry.get_name(&elf) == Ok("__stlog_debug_start__") {
+                debug_start = Some(entry.value());
+            } else if entry.get_name(&elf) == Ok("__stlog_debug_end__") {
+                debug_end = Some(entry.value());
+            } else if entry.get_name(&elf) == Ok("__stlog_trace_start__") {
+                trace_start = Some(entry.value());
+            } else if entry.get_name(&elf) == Ok("__stlog_trace_end__") {
+                trace_end = Some(entry.value());
+            }
+        }
+    }
+
+    let error_end =
+        error_end.ok_or_else(|| failure::err_msg("__stlog_error_end__ symbol not found"))?;
+    let warn_start =
+        warn_start.ok_or_else(|| failure::err_msg("__stlog_warn_start__ symbol not found"))?;
+    let warn_end =
+        warn_end.ok_or_else(|| failure::err_msg("__stlog_warn_end__ symbol not found"))?;
+    let info_start =
+        info_start.ok_or_else(|| failure::err_msg("__stlog_info_start__ symbol not found"))?;
+    let info_end =
+        info_end.ok_or_else(|| failure::err_msg("__stlog_info_end__ symbol not found"))?;
+    let debug_start =
+        debug_start.ok_or_else(|| failure::err_msg("__stlog_debug_start__ symbol not found"))?;
+    let debug_end =
+        debug_end.ok_or_else(|| failure::err_msg("__stlog_debug_end__ symbol not found"))?;
+    let trace_start =
+        trace_start.ok_or_else(|| failure::err_msg("__stlog_trace_start__ symbol not found"))?;
+    let trace_end =
+        trace_end.ok_or_else(|| failure::err_msg("__stlog_trace_end__ symbol not found"))?;
+
+    // address -> message
+    let mut messages = HashMap::new();
+
+    for entry in unclassified_messages {
+        let address = entry.value();
+
+        let severity = if address >= error_start && address < error_end {
+            Level::Error
+        } else if address >= warn_start && address < warn_end {
+            Level::Warning
+        } else if address >= info_start && address < info_end {
+            Level::Info
+        } else if address >= debug_start && address < debug_end {
+            Level::Debug
+        } else if address >= trace_start && address < trace_end {
+            Level::Trace
+        } else {
+            bail!("Found message with invalid address: {}", address)
+        };
+
+        messages.insert(
+            address,
+            Message {
+                severity,
+                content: entry.get_name(&elf).map_err(failure::err_msg)?,
+            },
+        );
+    }
+
+    Ok(messages)
+}
+
+struct Message<'a> {
+    severity: Level,
+    content: &'a str,
 }
