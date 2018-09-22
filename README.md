@@ -13,9 +13,13 @@
 $ cargo install stcat
 
 $ cat /dev/ttyUSB0 | stcat -e /path/to/device/binary
-INFO Hello, world!
-WARN The quick brown fox jumps over the lazy dog.
+//! Sept 22 13:00:00.000 INFO Hello, world!
+//! Sept 22 13:00:00.001 WARN The quick brown fox jumps over the lazy dog
 ```
+
+See [`stlog`] for more information.
+
+[`stlog`]: https://crates.io/crates/stlog
 
 ## License
 

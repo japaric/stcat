@@ -5,8 +5,9 @@ description = "Decode logs produced by the `stlog` framework"
 keywords = ["ELF", "symtab"]
 license = "MIT OR Apache-2.0"
 name = "stcat"
+readme = "README.md"
 repository = "https://github.com/japaric/stcat"
-version = "0.2.0"
+version = "0.2.1"
 
 [dependencies]
 failure = "0.1.2"
