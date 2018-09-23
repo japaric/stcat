@@ -125,21 +125,15 @@ fn process_symtab<'a, E>(
 where
     E: Entry,
 {
-    let (error_start, shndx) = entries
+    let (warning_start, shndx) = entries
         .iter()
-        .find(|entry| entry.get_name(&elf) == Ok("__stlog_error_start__"))
+        .find(|entry| entry.get_name(&elf) == Ok("__stlog_warning_start__"))
         .map(|entry| (entry.value(), entry.shndx()))
-        .ok_or_else(|| failure::err_msg("symbol `__stlog_error_start__` not found"))?;
+        .ok_or_else(|| failure::err_msg("symbol `__stlog_warning_start__` not found"))?;
 
-    let mut error_end = None;
-    let mut warn_start = None;
-    let mut warn_end = None;
     let mut info_start = None;
-    let mut info_end = None;
     let mut debug_start = None;
-    let mut debug_end = None;
     let mut trace_start = None;
-    let mut trace_end = None;
 
     let mut unclassified_messages = vec![];
 
@@ -153,46 +147,22 @@ where
                 continue;
             }
 
-            if entry.get_name(&elf) == Ok("__stlog_error_end__") {
-                error_end = Some(entry.value());
-            } else if entry.get_name(&elf) == Ok("__stlog_warn_start__") {
-                warn_start = Some(entry.value());
-            } else if entry.get_name(&elf) == Ok("__stlog_warn_end__") {
-                warn_end = Some(entry.value());
-            } else if entry.get_name(&elf) == Ok("__stlog_info_start__") {
+            if entry.get_name(&elf) == Ok("__stlog_info_start__") {
                 info_start = Some(entry.value());
-            } else if entry.get_name(&elf) == Ok("__stlog_info_end__") {
-                info_end = Some(entry.value());
             } else if entry.get_name(&elf) == Ok("__stlog_debug_start__") {
                 debug_start = Some(entry.value());
-            } else if entry.get_name(&elf) == Ok("__stlog_debug_end__") {
-                debug_end = Some(entry.value());
             } else if entry.get_name(&elf) == Ok("__stlog_trace_start__") {
                 trace_start = Some(entry.value());
-            } else if entry.get_name(&elf) == Ok("__stlog_trace_end__") {
-                trace_end = Some(entry.value());
             }
         }
     }
 
-    let error_end =
-        error_end.ok_or_else(|| failure::err_msg("__stlog_error_end__ symbol not found"))?;
-    let warn_start =
-        warn_start.ok_or_else(|| failure::err_msg("__stlog_warn_start__ symbol not found"))?;
-    let warn_end =
-        warn_end.ok_or_else(|| failure::err_msg("__stlog_warn_end__ symbol not found"))?;
     let info_start =
         info_start.ok_or_else(|| failure::err_msg("__stlog_info_start__ symbol not found"))?;
-    let info_end =
-        info_end.ok_or_else(|| failure::err_msg("__stlog_info_end__ symbol not found"))?;
     let debug_start =
         debug_start.ok_or_else(|| failure::err_msg("__stlog_debug_start__ symbol not found"))?;
-    let debug_end =
-        debug_end.ok_or_else(|| failure::err_msg("__stlog_debug_end__ symbol not found"))?;
     let trace_start =
         trace_start.ok_or_else(|| failure::err_msg("__stlog_trace_start__ symbol not found"))?;
-    let trace_end =
-        trace_end.ok_or_else(|| failure::err_msg("__stlog_trace_end__ symbol not found"))?;
 
     // address -> message
     let mut messages = HashMap::new();
@@ -200,15 +170,15 @@ where
     for entry in unclassified_messages {
         let address = entry.value();
 
-        let severity = if address >= error_start && address < error_end {
+        let severity = if address < warning_start {
             Level::Error
-        } else if address >= warn_start && address < warn_end {
+        } else if address >= warning_start && address < info_start {
             Level::Warning
-        } else if address >= info_start && address < info_end {
+        } else if address >= info_start && address < debug_start {
             Level::Info
-        } else if address >= debug_start && address < debug_end {
+        } else if address >= debug_start && address < trace_start {
             Level::Debug
-        } else if address >= trace_start && address < trace_end {
+        } else if address >= trace_start {
             Level::Trace
         } else {
             bail!("Found message with invalid address: {}", address)
