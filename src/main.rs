@@ -21,7 +21,7 @@ use clap::{App, Arg};
 use slog::{Drain, Level, Logger};
 use slog_async::Async;
 use slog_term::{CompactFormat, TermDecorator};
-use xmas_elf::{sections::SectionData, symbol_table::Entry, ElfFile};
+use xmas_elf::{sections::SectionData, symbol_table::{Entry, Type}, ElfFile};
 
 fn main() {
     if let Err(e) = run() {
@@ -139,10 +139,7 @@ where
 
     for entry in entries {
         if entry.shndx() == shndx {
-            // magic `info` value
-            const MAGIC: u8 = 1;
-
-            if entry.info() == MAGIC {
+            if entry.get_type().map_err(failure::err_msg)? == Type::Object {
                 unclassified_messages.push(entry);
                 continue;
             }
